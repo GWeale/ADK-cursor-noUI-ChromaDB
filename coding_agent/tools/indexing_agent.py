@@ -50,7 +50,7 @@ class IndexingAgent:
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         # Initialize ChromaDB with persistent storage
-        persist_dir = str(self.project_root / ".adk_index_storage")
+        persist_dir = str(self.project_root / ".adk_index")
         os.makedirs(persist_dir, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         

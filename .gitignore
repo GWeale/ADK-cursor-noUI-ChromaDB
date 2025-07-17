@@ -5,6 +5,7 @@ ENV/
 README.md
 README_2.md
 coding_agent/.env
+.adk_index/
 
 # Python artifacts
 __pycache__/
