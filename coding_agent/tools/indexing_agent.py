@@ -50,7 +50,7 @@ class IndexingAgent:
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         # Initialize ChromaDB with persistent storage
-        persist_dir = str(self.project_root / ".adk_index")
+        persist_dir = str(self.project_root / ".adk_index_storage")
         os.makedirs(persist_dir, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         
@@ -75,7 +75,7 @@ class IndexingAgent:
         self.parsers = self._init_parsers()
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
         
-    def _init_parsers(self) -> Dict[str, tree_sitter.Parser]:
+    def _init_parsers(self) -> Dict[str, tree_sitter.Parser]: #boilerplate code form https://www.youtube.com/watch?v=bP0zl4K_LY8
         """Initialize tree-sitter parsers for different languages"""
         parsers = {}
         
