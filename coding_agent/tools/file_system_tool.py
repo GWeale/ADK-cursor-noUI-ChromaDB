@@ -6,7 +6,6 @@ PROJECT_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(_
 
 def _is_path_safe(path: str) -> bool:
     """Checks if the provided path is within the project root."""
-    # absolute path to prevent directory traversal attacks (e.g., "../..")
     abs_path = os.path.abspath(os.path.join(PROJECT_ROOT, path))
     return abs_path.startswith(PROJECT_ROOT)
 
