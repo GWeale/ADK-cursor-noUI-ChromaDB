@@ -1,9 +1,10 @@
 from typing import List, Dict, Any, Optional, Union
-from google.adk.tools import FunctionTool
+from google.adk.tools import FunctionTool, ToolContext
 from sentence_transformers import SentenceTransformer
 import chromadb
 from pathlib import Path
 import os
+import datetime
 
 class VectorSearchTool:
     """Tool for semantic search over the indexed codebase"""
@@ -28,246 +29,216 @@ class VectorSearchTool:
             self.code_collection = None
             self.file_collection = None
     
-    def semantic_search(self, query: str, max_results: int = 5, file_type_filter: Optional[str] = None) -> str:
-        if not self.code_collection:
-            return "No code index found. Please run indexing first."
-        # Create query embedding
-        query_embedding = self.embedding_model.encode(query).tolist()
-        where_filter = None
-        if file_type_filter:
-            from typing import Any, cast
-            where_filter = cast(Any, {"file_type": file_type_filter})
-        results = self.code_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=max_results,
-            where=where_filter
-        )
-        documents = results.get('documents')
-        metadatas = results.get('metadatas') 
-        distances = results.get('distances')
-        if not documents or not documents[0] or not metadatas or not metadatas[0] or not distances or not distances[0]:
-            return f"No results found for query: '{query}'"
-        doc_list = documents[0]
-        meta_list = metadatas[0] 
-        dist_list = distances[0]
-        if not (doc_list and meta_list and dist_list):
-            return f"No results found for query: '{query}'"
-        if not (len(doc_list) == len(meta_list) == len(dist_list)):
-            return f"Inconsistent result data for query: '{query}'"
-        formatted_results = []
-        for i, (doc, metadata, distance) in enumerate(zip(doc_list, meta_list, dist_list)):
-            if not isinstance(metadata, dict):
-                continue
-            result_text = f"Result {i+1} (similarity: {1-distance:.3f}):\n"
-            result_text += f"  Name: {metadata.get('name', 'unknown')}\n"
-            result_text += f"  Type: {metadata.get('element_type', 'unknown')}\n"
-            result_text += f"  File: {metadata.get('file_path', 'unknown')}\n"
-            result_text += f"  Lines: {metadata.get('start_line', 'unknown')}-{metadata.get('end_line', 'unknown')}\n"
-            if metadata.get('docstring'):
-                docstring = str(metadata['docstring'])
-                if len(docstring) > 100:
-                    docstring = docstring[:100] + "..."
-                result_text += f"  Docstring: {docstring}\n"
-            content = metadata.get('content', '')
-            if isinstance(content, str) and len(content) > 300:
-                content = content[:300] + "..."
-            result_text += f"  Content:\n{content}\n"
-            result_text += "-" * 50 + "\n"
-            formatted_results.append(result_text)
-        return "\n".join(formatted_results)
+    def _log_search(self, tool_context: ToolContext, query: str, search_type: str, results_count: int, successful: bool):
+        """Log search operations to session state"""
+        search_history = tool_context.state.get("search_history", [])
+        search_history.append({
+            "timestamp": datetime.datetime.now().isoformat(),
+            "query": query,
+            "search_type": search_type,
+            "results_count": results_count,
+            "successful": successful
+        })
+        tool_context.state["search_history"] = search_history[-50:]  # Keep last 50 searches
+        
+        # Update search counters
+        counters = tool_context.state.get("search_counters", {})
+        counters[search_type] = counters.get(search_type, 0) + 1
+        tool_context.state["search_counters"] = counters
     
-    def find_files_by_content(self, query: str, max_results: int = 5) -> str:
-        """
-        Find files by content similarity
-        
-        Args:
-            query: Search query for file content
-            max_results: Maximum number of files to return
-        
-        Returns:
-            Formatted file search results
-        """
-        if not self.file_collection:
-            return "No file index found. Please run indexing first."
-        
+    def semantic_search(self, query: str, max_results: int = 5, file_type_filter: Optional[str] = None, tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
+        if not self.code_collection:
+            if tool_context:
+                self._log_search(tool_context, query, "semantic_code", 0, False)
+            return {"status": "error", "message": "No code index found. Please run indexing first.", "results": []}
+            
         try:
             # Create query embedding
             query_embedding = self.embedding_model.encode(query).tolist()
             
-            # Search in file summaries
+            if file_type_filter and file_type_filter.strip():
+                results = self.code_collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=max_results,
+                    where={"file_type": file_type_filter}
+                )
+            else:
+                results = self.code_collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=max_results
+                )
+            
+            documents = results.get('documents', [])
+            metadatas = results.get('metadatas', [])
+            distances = results.get('distances', [])
+            
+            # Safely check for empty results
+            if not documents or not documents[0]:
+                if tool_context:
+                    self._log_search(tool_context, query, "semantic_code", 0, True)
+                return {"status": "success", "message": f"No results found for query: '{query}'", "results": []}
+            
+            formatted_results = []
+            doc_list = documents[0]
+            meta_list = metadatas[0] if metadatas else []
+            dist_list = distances[0] if distances else []
+            
+            for i, doc in enumerate(doc_list):
+                meta = meta_list[i] if i < len(meta_list) else {}
+                dist = dist_list[i] if i < len(dist_list) else 1.0
+                
+                result = {
+                    "rank": i + 1,
+                    "similarity_score": 1 - dist,  # Convert distance to similarity
+                    "element_name": meta.get("name", "Unknown"),
+                    "element_type": meta.get("element_type", "Unknown"),
+                    "file_path": meta.get("file_path", "Unknown"),
+                    "start_line": meta.get("start_line", 0),
+                    "end_line": meta.get("end_line", 0),
+                    "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
+                    "docstring": meta.get("docstring", "")
+                }
+                formatted_results.append(result)
+            
+            # Store search results in session state for reference
+            if tool_context:
+                self._log_search(tool_context, query, "semantic_code", len(formatted_results), True)
+                tool_context.state["last_search_results"] = formatted_results
+                tool_context.state["last_search_query"] = query
+                
+                # Build cumulative knowledge
+                found_files = set(tool_context.state.get("discovered_files", []))
+                for result in formatted_results:
+                    found_files.add(result["file_path"])
+                tool_context.state["discovered_files"] = list(found_files)
+            
+            return {
+                "status": "success", 
+                "query": query,
+                "results_count": len(formatted_results),
+                "results": formatted_results
+            }
+            
+        except Exception as e:
+            if tool_context:
+                self._log_search(tool_context, query, "semantic_code", 0, False)
+            return {"status": "error", "message": f"Search failed: {str(e)}", "results": []}
+
+    def find_files_by_content(self, query: str, max_results: int = 5, tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
+        if not self.file_collection:
+            if tool_context:
+                self._log_search(tool_context, query, "file_search", 0, False)
+            return {"status": "error", "message": "No file index found. Please run indexing first.", "results": []}
+        
+        try:
+            query_embedding = self.embedding_model.encode(query).tolist()
+            
             results = self.file_collection.query(
                 query_embeddings=[query_embedding],
                 n_results=max_results
             )
             
-            # Safely extract results with proper type checking
-            documents = results.get('documents')
-            metadatas = results.get('metadatas')
-            distances = results.get('distances')
+            documents = results.get('documents', [])
+            metadatas = results.get('metadatas', [])
+            distances = results.get('distances', [])
             
-            if not documents or not documents[0] or not metadatas or not metadatas[0] or not distances or not distances[0]:
-                return f"No files found for query: '{query}'"
+            if not documents or not documents[0]:
+                if tool_context:
+                    self._log_search(tool_context, query, "file_search", 0, True)
+                return {"status": "success", "message": f"No files found for query: '{query}'", "results": []}
             
-            # Type assertions to help the type checker
+            formatted_results = []
             doc_list = documents[0]
-            meta_list = metadatas[0]
-            dist_list = distances[0]
+            meta_list = metadatas[0] if metadatas else []
+            dist_list = distances[0] if distances else []
             
-            # Ensure all lists are valid and same length
-            if not (doc_list and meta_list and dist_list):
-                return f"No files found for query: '{query}'"
+            for i, doc in enumerate(doc_list):
+                meta = meta_list[i] if i < len(meta_list) else {}
+                dist = dist_list[i] if i < len(dist_list) else 1.0
                 
-            if not (len(doc_list) == len(meta_list) == len(dist_list)):
-                return f"Inconsistent file data for query: '{query}'"
+                result = {
+                    "rank": i + 1,
+                    "similarity_score": 1 - dist,
+                    "file_path": meta.get("file_path", "Unknown"),
+                    "file_type": meta.get("file_type", "Unknown"),
+                    "element_count": meta.get("element_count", 0),
+                    "summary": doc[:300] + "..." if len(doc) > 300 else doc
+                }
+                formatted_results.append(result)
             
-            formatted_results = []
-            for i, (doc, metadata, distance) in enumerate(zip(doc_list, meta_list, dist_list)):
-                # Ensure metadata is a dictionary
-                if not isinstance(metadata, dict):
-                    continue
-                    
-                result_text = f"File {i+1} (similarity: {1-distance:.3f}):\n"
-                result_text += f"  Path: {metadata.get('file_path', 'unknown')}\n"
-                result_text += f"  Type: {metadata.get('file_type', 'unknown')}\n"
-                result_text += f"  Lines: {metadata.get('line_count', 'unknown')}\n"
-                result_text += f"  Elements: {metadata.get('element_count', 'unknown')}\n"
-                result_text += f"  Summary: {metadata.get('summary', 'No summary available')}\n"
+            if tool_context:
+                self._log_search(tool_context, query, "file_search", len(formatted_results), True)
+                tool_context.state["last_file_search_results"] = formatted_results
                 
-                if metadata.get('elements_by_type_str'):
-                    result_text += f"  Contains: {metadata['elements_by_type_str']}\n"
-                
-                result_text += "-" * 40 + "\n"
-                formatted_results.append(result_text)
+                # Update discovered files
+                found_files = set(tool_context.state.get("discovered_files", []))
+                for result in formatted_results:
+                    found_files.add(result["file_path"])
+                tool_context.state["discovered_files"] = list(found_files)
             
-            return "\n".join(formatted_results)
+            return {
+                "status": "success",
+                "query": query, 
+                "results_count": len(formatted_results),
+                "results": formatted_results
+            }
             
         except Exception as e:
-            return f"Error finding files: {str(e)}"
-    
-    def find_elements_by_type(self, element_type: str, max_results: int = 10) -> str:
-        """
-        Find code elements by type (function, class, method, etc.)
-        
-        Args:
-            element_type: Type of element to find
-            max_results: Maximum number of results
-        
-        Returns:
-            Formatted results
-        """
+            if tool_context:
+                self._log_search(tool_context, query, "file_search", 0, False)
+            return {"status": "error", "message": f"File search failed: {str(e)}", "results": []}
+
+    def get_file_structure(self, file_path: str, tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
         if not self.code_collection:
-            return "No code index found. Please run indexing first."
+            return {"status": "error", "message": "No code index found. Please run indexing first.", "elements": []}
         
         try:
-            # Search for elements of specific type
-            results = self.code_collection.get(
-                where={"element_type": element_type},
-                limit=max_results
-            )
-            
-            # Safely check if we have results
-            documents = results.get('documents')
-            metadatas = results.get('metadatas')
-            
-            if not documents or not metadatas:
-                return f"No {element_type} elements found."
-            
-            # Ensure both lists exist and are not empty
-            if not isinstance(documents, list) or not isinstance(metadatas, list):
-                return f"Invalid data format for {element_type} elements."
-                
-            if len(documents) == 0 or len(metadatas) == 0:
-                return f"No {element_type} elements found."
-            
-            formatted_results = []
-            for i, (doc, metadata) in enumerate(zip(documents, metadatas)):
-                # Ensure metadata is a dictionary
-                if not isinstance(metadata, dict):
-                    continue
-                    
-                result_text = f"{element_type.title()} {i+1}:\n"
-                result_text += f"  Name: {metadata.get('name', 'unknown')}\n"
-                result_text += f"  File: {metadata.get('file_path', 'unknown')}\n"
-                result_text += f"  Lines: {metadata.get('start_line', 'unknown')}-{metadata.get('end_line', 'unknown')}\n"
-                result_text += "-" * 30 + "\n"
-                
-                formatted_results.append(result_text)
-            
-            return "\n".join(formatted_results)
-            
-        except Exception as e:
-            return f"Error finding {element_type} elements: {str(e)}"
-    
-    def get_file_structure(self, file_path: str) -> str:
-        """
-        Get the structure of a specific file
-        
-        Args:
-            file_path: Path to the file
-        
-        Returns:
-            Formatted file structure
-        """
-        if not self.code_collection:
-            return "No code index found. Please run indexing first."
-        
-        try:
-            # Search for elements in the specific file
+            # Search for all elements from this specific file
             results = self.code_collection.get(
                 where={"file_path": file_path}
             )
             
-            # Safely check results
-            metadatas = results.get('metadatas')
-            if not metadatas or not isinstance(metadatas, list):
-                return f"No structure information found for {file_path}"
+            if not results or not results.get('metadatas'):
+                return {"status": "success", "message": f"No indexed elements found for file: {file_path}", "elements": []}
             
-            file_info = ""
+            elements = []
+            metadatas = results.get('metadatas', [])
+            if metadatas:
+                for meta in metadatas:
+                    element = {
+                        "name": meta.get("name", "Unknown"),
+                        "type": meta.get("element_type", "Unknown"),
+                        "start_line": meta.get("start_line", 0),
+                        "end_line": meta.get("end_line", 0),
+                        "docstring": meta.get("docstring", "")
+                    }
+                    elements.append(element)
             
-            # Try to get file-level information
-            if self.file_collection:
-                try:
-                    file_results = self.file_collection.get(ids=[file_path])
-                    file_metadatas = file_results.get('metadatas')
-                    if file_metadatas and isinstance(file_metadatas, list) and len(file_metadatas) > 0:
-                        metadata = file_metadatas[0]
-                        if isinstance(metadata, dict):
-                            file_info = f"File: {file_path}\n"
-                            file_info += f"Type: {metadata.get('file_type', 'unknown')}\n"
-                            file_info += f"Lines: {metadata.get('line_count', 'unknown')}\n"
-                            file_info += f"Total elements: {metadata.get('element_count', 'unknown')}\n\n"
-                except:
-                    pass
+            # Sort by line number
+            elements.sort(key=lambda x: x["start_line"])
             
-            # Format elements
-            elements_by_type: Dict[str, List[Dict[str, Any]]] = {}
-            for metadata in metadatas:
-                if not isinstance(metadata, dict):
-                    continue
-                element_type = metadata.get('element_type', 'unknown')
-                if isinstance(element_type, str):
-                    if element_type not in elements_by_type:
-                        elements_by_type[element_type] = []
-                    elements_by_type[element_type].append(metadata)
+            # Store file context in session state
+            if tool_context:
+                file_contexts = tool_context.state.get("file_contexts", {})
+                file_contexts[file_path] = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "element_count": len(elements),
+                    "elements": elements
+                }
+                tool_context.state["file_contexts"] = file_contexts
+                tool_context.state["last_analyzed_file"] = file_path
             
-            formatted_results = [file_info]
-            
-            for element_type, elements in elements_by_type.items():
-                formatted_results.append(f"{element_type.upper()}S:")
-                for element in elements:
-                    name = element.get('name', 'unknown')
-                    start_line = element.get('start_line', 'unknown')
-                    end_line = element.get('end_line', 'unknown')
-                    formatted_results.append(f"  - {name} (lines {start_line}-{end_line})")
-                formatted_results.append("")
-            
-            return "\n".join(formatted_results)
+            return {
+                "status": "success",
+                "file_path": file_path,
+                "element_count": len(elements),
+                "elements": elements
+            }
             
         except Exception as e:
-            return f"Error getting file structure: {str(e)}"
+            return {"status": "error", "message": f"Failed to get file structure: {str(e)}", "elements": []}
 
-# Create the ADK tools
-def search_code_tool(query: str, max_results: int = 10, element_types: str = "") -> str:
+def search_code_tool(query: str, max_results: int = 10, element_types: str = "", tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
     """Search for code elements using semantic similarity"""
     # Get project root from environment or use default
     import os
@@ -282,25 +253,36 @@ def search_code_tool(query: str, max_results: int = 10, element_types: str = "")
     
     # Since semantic_search expects file_type_filter, not element types, use first type if available
     file_filter = types_list[0] if types_list else None
-    return search_tool.semantic_search(query, max_results, file_filter)
+    return search_tool.semantic_search(query, max_results, file_filter, tool_context)
 
-def search_files_tool(query: str, max_results: int = 5) -> str:
+def search_files_tool(query: str, max_results: int = 5, tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
     """Search for files based on their summaries"""
     import os
     project_root = os.environ.get('ADK_PROJECT_ROOT', os.getcwd())
     
     search_tool = VectorSearchTool(project_root)
-    return search_tool.find_files_by_content(query, max_results)
+    return search_tool.find_files_by_content(query, max_results, tool_context)
 
-def get_file_context_tool(file_path: str, max_elements: int = 20) -> str:
+def get_file_context_tool(file_path: str, max_elements: int = 20, tool_context: Optional[ToolContext] = None) -> Dict[str, Any]:
     """Get context about a specific file including all its code elements"""
     import os
     project_root = os.environ.get('ADK_PROJECT_ROOT', os.getcwd())
     
     search_tool = VectorSearchTool(project_root)
-    return search_tool.get_file_structure(file_path)
+    return search_tool.get_file_structure(file_path, tool_context)
 
-# ADK tool wrappers
+def get_search_summary_tool(tool_context: ToolContext) -> Dict[str, Any]:
+    """Get a summary of all search operations performed in this session"""
+    return {
+        "search_counters": tool_context.state.get("search_counters", {}),
+        "discovered_files": tool_context.state.get("discovered_files", []),
+        "recent_searches": tool_context.state.get("search_history", [])[-10:],  # Last 10 searches
+        "last_search_query": tool_context.state.get("last_search_query", ""),
+        "analyzed_files": list(tool_context.state.get("file_contexts", {}).keys())
+    }
+
+# Create the ADK tools
 search_code_adk_tool = FunctionTool(search_code_tool)
-search_files_adk_tool = FunctionTool(search_files_tool)
-get_file_context_adk_tool = FunctionTool(get_file_context_tool) 
+search_files_adk_tool = FunctionTool(search_files_tool) 
+get_file_context_adk_tool = FunctionTool(get_file_context_tool)
+search_summary_adk_tool = FunctionTool(get_search_summary_tool) 
